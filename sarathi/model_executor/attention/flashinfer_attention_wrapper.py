@@ -1,7 +1,13 @@
 from typing import List, Optional
 
 import torch
-from flashinfer import BatchPrefillWithPagedKVCacheWrapper, append_paged_kv_cache
+from flashinfer import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    append_paged_kv_cache,
+    get_seq_lens,
+    get_batch_indices_positions,
+)
+
 
 from sarathi.config import ModelConfig, ParallelConfig
 from sarathi.core.datatypes.sequence import SequenceMetadata
@@ -221,14 +227,28 @@ class FlashinferAttentionWrapper(BaseAttentionWrapper):
         output = torch.empty_like(query)
 
         with self.get_timer(OperationMetrics.ATTN_KV_CACHE_SAVE, layer_id):
+            # 标准化 dtype / device（int32 + CUDA）
+            qo_indptr = self.append_qo_indptr_tensor.to(dtype=torch.int32, device=self.device)
+            kv_page_indices = self.append_kv_page_indices_tensor.to(dtype=torch.int32, device=self.device)
+            kv_page_indptr = self.append_kv_page_indptr_tensor.to(dtype=torch.int32, device=self.device)
+            kv_last_page_len = self.append_kv_last_page_len_tensor.to(dtype=torch.int32, device=self.device)
+
+            # 从 paged KV 的结构得到每个 request 的序列长度（单位：token）
+            seq_lens = get_seq_lens(kv_page_indptr, kv_last_page_len, self.block_size)
+
+            # 由 ragged 的 append indptr（= qo_indptr）+ 各 request 长度 -> (batch_indices, positions)
+            nnz_kv = int(qo_indptr[-1].item())
+            batch_indices, positions = get_batch_indices_positions(qo_indptr, seq_lens, nnz_kv)
+
             append_paged_kv_cache(
-                key,
-                value,
-                self.append_qo_indptr_tensor,
-                kv_cache,
-                self.append_kv_page_indices_tensor,
-                self.append_kv_page_indptr_tensor,
-                self.append_kv_last_page_len_tensor,
+                key,                      # [nnz_kv, num_kv_heads, head_dim]
+                value,                    # [nnz_kv, num_kv_heads, head_dim]
+                batch_indices,            # [nnz_kv] int32 CUDA
+                positions,                # [nnz_kv] int32 CUDA
+                kv_cache,                 # paged KV cache
+                kv_page_indices,          # [kv_page_indptr[-1]] int32 CUDA
+                kv_page_indptr,           # [batch+1] int32 CUDA
+                kv_last_page_len,         # [batch] int32 CUDA
                 kv_layout="NHD",
             )
 
